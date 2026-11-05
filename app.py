@@ -3,16 +3,19 @@ Zeigt das Board (web/board.html) und füllt es mit Live-Daten von Yahoo Finance.
 Nachrichten werden automatisch ins Deutsche übersetzt und als Kurzfassung direkt im Board gezeigt."""
 import html
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
 import yfinance as yf
-from deep_translator import GoogleTranslator
+from deep_translator import GoogleTranslator, MyMemoryTranslator
 
 st.set_page_config(page_title="S&H Marktboard", page_icon="logo.png", layout="wide", initial_sidebar_state="collapsed")
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -96,7 +99,15 @@ def logo_urls(ticker):
     return urls
 
 
-# ---------- Übersetzung ins Deutsche (mit Zwischenspeicher) ----------
+# ---------- Übersetzung ins Deutsche (mehrere Wege, mit Zwischenspeicher) ----------
+ENGLISCH = {"the", "and", "to", "of", "in", "is", "for", "on", "with", "as", "after", "its", "by", "from", "stock", "stocks",
+            "shares", "says", "are", "will", "this", "that", "why", "how", "what", "today", "market", "investors"}
+
+
+def englisch(t):
+    return len(set(re.findall(r"[a-z']+", str(t).lower())) & ENGLISCH) >= 2
+
+
 @st.cache_resource
 def _uebersetzungen():
     return {}
@@ -106,30 +117,42 @@ def _glatt(t):
     return " ".join(str(t).split())[:500]
 
 
+def _gtx(text):
+    r = requests.get("https://translate.googleapis.com/translate_a/single",
+                     params={"client": "gtx", "sl": "auto", "tl": "de", "dt": "t", "q": text}, timeout=12)
+    r.raise_for_status()
+    return "".join(seg[0] for seg in r.json()[0] if seg and seg[0])
+
+
+def _eins(t):
+    for weg in (lambda x: _gtx(x), lambda x: GoogleTranslator(source="auto", target="de").translate(x),
+                lambda x: MyMemoryTranslator(source="en-GB", target="de-DE").translate(x)):
+        try:
+            aus = weg(t)
+            if aus and not englisch(aus):
+                return aus
+        except Exception:
+            continue
+    return None
+
+
 def _block(texte):
-    """Mehrere Texte in einem Rutsch übersetzen (Zeilen bleiben erhalten)."""
     try:
-        aus = GoogleTranslator(source="auto", target="de").translate("\n".join(texte)) or ""
-        teile = aus.split("\n")
-        if len(teile) == len(texte):
+        teile = _gtx("\n".join(texte)).split("\n")
+        if len(teile) == len(texte) and not any(englisch(x) for x in teile):
             return teile
     except Exception:
         pass
-    erg = []
-    for t in texte:
-        try:
-            erg.append(GoogleTranslator(source="auto", target="de").translate(t) or t)
-        except Exception:
-            erg.append(t)
-    return erg
+    return [_eins(t) for t in texte]
 
 
 def deutsch(texte):
+    """Übersetzt alle Texte. Rückgabe: Funktion, die zu jedem Text die deutsche Fassung liefert oder None."""
     speicher = _uebersetzungen()
     neu = [t for t in dict.fromkeys(_glatt(x) for x in texte if x) if t not in speicher]
     bloecke, akt, n = [], [], 0
     for t in neu:
-        if akt and n + len(t) > 3500:
+        if akt and n + len(t) > 1500:
             bloecke.append(akt)
             akt, n = [], 0
         akt.append(t)
@@ -139,7 +162,15 @@ def deutsch(texte):
     with ThreadPoolExecutor(4) as ex:
         for blk, erg in zip(bloecke, ex.map(_block, bloecke)):
             speicher.update(zip(blk, erg))
-    return lambda x: speicher.get(_glatt(x), x) if x else x
+
+    def tr(x):
+        if not x:
+            return None
+        g = _glatt(x)
+        if g in speicher and speicher[g]:
+            return speicher[g]
+        return None if englisch(g) else g   # schon deutsch (z. B. deutsche Quellen)
+    return tr
 
 
 # ---------- Daten holen ----------
@@ -160,7 +191,11 @@ def intraday_alle(tickers: tuple):
 
 def _news(ticker):
     try:
-        roh = yf.Ticker(ticker).news or []
+        tk = yf.Ticker(ticker)
+        try:
+            roh = tk.get_news(count=40, tab="news") or []
+        except Exception:
+            roh = tk.news or []
     except Exception:
         return ticker, []
     out = []
@@ -174,7 +209,7 @@ def _news(ticker):
         link = url.get("url") if isinstance(url, dict) else c.get("link")
         prov = c.get("provider")
         quelle = prov.get("displayName") if isinstance(prov, dict) else c.get("publisher", "")
-        out.append({"zeit": ts.tz_convert(BERLIN), "titel": titel, "text": c.get("summary") or c.get("description") or "",
+        out.append({"zeit": ts.tz_convert(BERLIN), "titel": titel, "text": (c.get("summary") or c.get("description") or "")[:400],
                     "link": link, "quelle": quelle or "Quelle"})
     return ticker, sorted(out, key=lambda x: x["zeit"])
 
@@ -227,23 +262,167 @@ def sitzung(kurs: pd.Series, boerse):
     jetzt = datetime.now(BERLIN)
     offen = boerse is KRYPTO or (tage[-1] == jetzt.date() and f(auf) <= minute(jetzt) < f(zu))
     dom = [min(f(auf), minute(heute.index[0])), max(f(zu), minute(heute.index[-1]))]
-    return {"heute": heute, "vortag": float(davor.iloc[-1]), "dom": dom, "pause": [f(pause[0]), f(pause[1])] if pause else None,
-            "status": "live" if offen else "close", "start": heute.index[0], "ende_davor": davor.index[-1]}
+    v0 = float(davor.iloc[-1])
+    return {"heute": heute, "vortag": v0, "pct": (heute / v0 - 1) * 100, "dom": dom,
+            "pause": [f(pause[0]), f(pause[1])] if pause else None, "status": "live" if offen else "close",
+            "start": heute.index[0], "ende_davor": davor.index[-1], "boerse": boerse}
 
 
-def ereignisse(meldungen, sz, prefix, tr, maximal=6):
-    """Nachrichten als Zeitstempel im Chart. Vorbörsliche Meldungen landen auf dem Handelsstart."""
-    ev = {}
-    passend = [n for n in meldungen if sz["ende_davor"] < n["zeit"] <= sz["heute"].index[-1] + timedelta(minutes=5)]
-    for i, n in enumerate(passend[-maximal:]):
-        vor = n["zeit"] < sz["start"]
-        t = minute(sz["start"]) + 1 if vor else minute(n["zeit"])
-        b = [html.escape(tr(n["text"]))] if n["text"] else []
-        if vor:
-            b.insert(0, f"Vor Handelsbeginn erschienen ({n['zeit']:%d.%m. %H:%M})")
-        ev[f"{prefix}{i}"] = {"t": t, "place": html.escape(n["quelle"]), "h": html.escape(tr(n["titel"])), "b": b, "w": "",
-                              "link": n["link"]}
-    return ev
+def zahl_de(x, stellen=1, vorzeichen=True):
+    s = f"{x:+,.{stellen}f}" if vorzeichen else f"{x:,.{stellen}f}"
+    return s.replace(",", "X").replace(".", ",").replace("X", ".").replace("-", "−")
+
+
+def dauer(t0, t1):
+    m = int((t1 - t0).total_seconds() // 60)
+    return f"{m} Min." if m < 60 else f"{m // 60} Std." + (f" {m % 60} Min." if m % 60 else "")
+
+
+def bewegungen(s: pd.Series, schwelle, maximal=4, fenster=24):
+    """Die größten Kursbewegungen (Prozentpunkte) innerhalb von höchstens 2 Stunden, ohne Überlappung."""
+    v = s.values.astype(float)
+    n = len(v)
+    belegt = np.zeros(n, bool)
+    out = []
+    for _ in range(maximal):
+        best = None
+        for i in range(1, n):
+            for j in range(max(0, i - fenster), i):
+                if belegt[j:i + 1].any():
+                    continue
+                d = v[i] - v[j]
+                if best is None or abs(d) > abs(best[2]):
+                    best = (j, i, d)
+        if not best or abs(best[2]) < schwelle:
+            break
+        j, i, d = best
+        belegt[j:i + 1] = True
+        out.append((s.index[j], s.index[i], float(d)))
+    return sorted(out)
+
+
+def aenderung(serie, t0, t1):
+    """Veränderung einer Vergleichsreihe im selben Zeitfenster, nur wenn sie dort Daten hat."""
+    if serie is None or serie.empty or t0 < serie.index[0] - timedelta(minutes=10) or t0 > serie.index[-1]:
+        return None
+    a, b = serie.asof(t0), serie.asof(min(t1, serie.index[-1]))
+    return None if pd.isna(a) or pd.isna(b) else float(b - a)
+
+
+def zeitpunkt_grund(t0, boerse):
+    m = minute(t0)
+    if boerse is XETRA:
+        if 540 <= m <= 570:
+            return "Handelsstart in Frankfurt um 9:00 Uhr: Aufträge aus der Nacht werden ausgeführt."
+        if 925 <= m <= 975:
+            return "Mit dem US-Börsenstart um 15:30 Uhr kommt oft Bewegung in den deutschen Markt."
+        if 865 <= m <= 890:
+            return "Um 14:30 Uhr erscheinen üblicherweise wichtige US-Konjunkturdaten."
+    elif boerse in (TOKIO, HK):
+        if m <= minute(datetime.combine(t0.date(), boerse[1], ZoneInfo(boerse[0])).astimezone(BERLIN)) + 30:
+            return "Erste halbe Stunde nach Handelsstart in Asien."
+    else:
+        if 865 <= m <= 890:
+            return "Um 14:30 Uhr erscheinen üblicherweise wichtige US-Konjunkturdaten."
+        if 925 <= m <= 975:
+            return "Erste Handelsstunde nach dem US-Börsenstart um 15:30 Uhr, wenn besonders viele Aufträge ausgeführt werden."
+        if 955 <= m <= 990:
+            return "Um 16:00 Uhr kommen oft weitere US-Daten wie Stimmungs- oder Immobilienzahlen."
+        if 1195 <= m <= 1230:
+            return "Um 20:00 Uhr veröffentlicht die US-Notenbank an Zinstagen ihre Entscheidung."
+        if 1230 <= m <= 1320:
+            return "Letzte Handelsstunde in New York: Fonds passen zum Schluss ihre Positionen an."
+    return None
+
+
+def plane(name, t0, t1, d, eigene, markt, vergleiche, termine, boerse, prozent=True, ist_luecke=False, seit=None):
+    """Sammelt alle Gründe für eine Bewegung, noch ohne Übersetzung."""
+    vor = timedelta(minutes=150 if ist_luecke else 120)
+    eigen = [n for n in eigene if (seit or t0 - vor) <= n["zeit"] <= t1 + timedelta(minutes=5)]
+    allg = [n for n in markt if t0 - timedelta(minutes=90) <= n["zeit"] <= t1 + timedelta(minutes=5)]
+    return {"name": name, "t0": t0, "t1": t1, "d": d, "eigen": eigen[-2:], "markt": allg[-1:], "vergleiche": vergleiche,
+            "termine": [e for e in termine if t0 - timedelta(hours=20) <= datetime.fromtimestamp(e["t"] / 1000, BERLIN) <= t1],
+            "boerse": boerse, "prozent": prozent, "luecke": ist_luecke}
+
+
+def schreibe(p, tr, nr):
+    """Macht aus dem Plan einen Zeitstempel mit deutscher Begründung."""
+    d, b, ausloeser, link, quelle = p["d"], [], None, None, None
+    verb = ("steigt" if d > 0 else "fällt")
+    if p["luecke"]:
+        titel = f"{p['name']} startet mit {zahl_de(d)} % {'Aufschlag' if d > 0 else 'Abschlag'}"
+    else:
+        titel = f"{p['name']} {verb} um {zahl_de(abs(d), vorzeichen=False)} % in {dauer(p['t0'], p['t1'])}"
+    for n in p["eigen"]:
+        de_t, de_x = tr(n["titel"]), tr(n["text"])
+        if not de_t:
+            continue
+        b.append(f"<b>{n['zeit']:%H:%M} Uhr, {html.escape(n['quelle'])}:</b> {html.escape(de_t)}" + (f" – {html.escape(de_x[:200])}" if de_x else ""))
+        ausloeser = ausloeser or html.escape(de_t)
+        link, quelle = n["link"], n["quelle"]
+    for e in p["termine"]:
+        wann = datetime.fromtimestamp(e["t"] / 1000, BERLIN)
+        if "act" in e and "est" in e:
+            ueber = e["act"]["eps"] >= e["est"]["eps"]
+            txt = (f"Quartalszahlen ({wann:%d.%m. %H:%M} Uhr): Gewinn je Aktie {zahl_de(e['act']['eps'], 2, False)} bei erwarteten "
+                   f"{zahl_de(e['est']['eps'], 2, False)} – {'über' if ueber else 'unter'} den Erwartungen.")
+        else:
+            txt = f"Quartalszahlen am {wann:%d.%m. um %H:%M} Uhr."
+        b.append(txt)
+        ausloeser = ausloeser or txt
+    for vname, c, art in p["vergleiche"]:
+        if c is None:
+            continue
+        if art == "vix":
+            b.append(f"VIX {('steigt' if c > 0 else 'fällt')} um {zahl_de(abs(c), 1, False)} Punkte – "
+                     f"{'Anleger werden nervöser.' if c > 0 else 'Anleger beruhigen sich.'}")
+            continue
+        if p["name"] == "Ø aller Märkte":
+            b.append(f"Treiber: {vname} {zahl_de(c)} % im selben Zeitraum.")
+            ausloeser = ausloeser or f"Getrieben vor allem von {vname} ({zahl_de(c)} %)."
+        elif abs(c) >= 0.35 * abs(d) and c * d > 0:
+            b.append(f"Gleichzeitig {vname} {zahl_de(c)} % – die Bewegung läuft mit dem Gesamtmarkt.")
+            ausloeser = ausloeser or f"Breite Marktbewegung: {vname} {zahl_de(c)} % im selben Zeitraum."
+        elif abs(c) < 0.2 * abs(d):
+            b.append(f"{vname} im selben Zeitraum kaum verändert ({zahl_de(c)} %) – die Bewegung ist eigenständig.")
+        elif c * d < 0:
+            b.append(f"{vname} läuft entgegengesetzt ({zahl_de(c)} %).")
+    eigene_titel = {n["titel"] for n in p["eigen"]}
+    for n in p["markt"]:
+        de_t = tr(n["titel"]) if n["titel"] not in eigene_titel else None
+        if de_t:
+            b.append(f"<b>Marktmeldung {n['zeit']:%H:%M} Uhr, {html.escape(n['quelle'])}:</b> {html.escape(de_t)}")
+            ausloeser = ausloeser or html.escape(de_t)
+            link, quelle = link or n["link"], quelle or n["quelle"]
+    zg = zeitpunkt_grund(p["t0"], p["boerse"])
+    if zg:
+        b.append(zg)
+        ausloeser = ausloeser or zg
+    if p["luecke"]:
+        b.insert(0, "Die Lücke entstand zwischen dem letzten Schlusskurs und dem Handelsstart.")
+    if not ausloeser:
+        ausloeser = "Kein einzelner Auslöser zu finden – vermutlich Gewinnmitnahmen oder normale Schwankung."
+    t = minute(p["t0"])
+    return f"m{nr}", {"t": t, "dir": 1 if d > 0 else -1, "place": "Kursbewegung", "h": titel, "b": b,
+                      "w": ausloeser, "link": link, "src": html.escape(quelle) if quelle else None}
+
+
+def plaene_fuer(name, sz, ticker, eigene, markt, vergleich_reihen, termine, schwelle_min, prozent=True):
+    s = sz["pct"] if prozent else sz["heute"]
+    spanne = float(s.max() - s.min()) if len(s) else 0
+    schwelle = max(schwelle_min, 0.28 * spanne)
+    plaene = []
+    erster = float(s.iloc[0]) if prozent else 0.0
+    if prozent and abs(erster) >= schwelle:
+        plaene.append(plane(name, sz["start"], sz["start"], erster, eigene, markt, [], termine, sz["boerse"], ist_luecke=True, seit=sz["ende_davor"]))
+    for t0, t1, d in bewegungen(s, schwelle):
+        if prozent:
+            vgl = [(vn, aenderung(vr, t0, t1), art) for vn, vr, art in vergleich_reihen]
+        else:
+            vgl = []
+        plaene.append(plane(name, t0, t1, d if prozent else (float(s.asof(t1)) / float(s.asof(t0)) - 1) * 100,
+                            eigene, markt, vgl, termine, sz["boerse"]))
+    return plaene
 
 
 @st.cache_data(ttl=120, show_spinner="Lade Live-Kurse und übersetze Nachrichten …")
@@ -251,63 +430,123 @@ def live_daten():
     jetzt = datetime.now(BERLIN)
     aktien = sorted({t for _, a in BRANCHEN.values() for t in a} | set(LISTE))
     kurse = intraday_alle(tuple({v[0] for v in INDIZES.values()} | set(aktien)))
-    news_tk = sorted({v[4] for v in INDIZES.values()} | set(aktien) | {etf for etf, _ in BRANCHEN.values()})
+    news_tk = sorted({v[4] for v in INDIZES.values()} | set(aktien) | {etf for etf, _ in BRANCHEN.values()} | {"SPY", "QQQ"})
     news = nachrichten_alle(tuple(news_tk))
+    termine = quartalszahlen(tuple(QUARTALS_LISTE))
+    termine_von = {}
+    for e in termine:
+        termine_von.setdefault(e["ytk"], []).append(e)
 
-    # alle Texte vorab gemeinsam übersetzen
-    texte = []
-    for liste in news.values():
-        for n in liste[-6:]:
-            texte += [n["titel"], n["text"]]
-    tr = deutsch(texte)
+    sitzungen = {t: sitzung(kurse[t], boerse_von(t) if t not in {v[0] for v in INDIZES.values()} else
+                            next(v[3] for v in INDIZES.values() if v[0] == t)) for t in kurse}
+    pct = {t: sz["pct"] for t, sz in sitzungen.items()}
+    vix_lvl = sitzungen["^VIX"]["heute"] if "^VIX" in sitzungen else None
+    REIHE = lambda name, t, art="pct": (name, (vix_lvl if art == "vix" else pct.get(t)), art)
+    US_VGL = [REIHE("S&P 500", "^GSPC"), REIHE("Nasdaq-100 (QQQ)", "QQQ")]
+    VGL = {"spx": [REIHE("Nasdaq-100 (QQQ)", "QQQ"), REIHE("VIX", "^VIX", "vix")], "qqq": [REIHE("S&P 500", "^GSPC"), REIHE("VIX", "^VIX", "vix")],
+           "dow": [REIHE("S&P 500", "^GSPC")], "spit": [REIHE("Nasdaq-100 (QQQ)", "QQQ")], "msci": [REIHE("S&P 500", "^GSPC")],
+           "ftseaw": [REIHE("S&P 500", "^GSPC")], "dax": [REIHE("S&P 500", "^GSPC"), REIHE("Nasdaq-100 (QQQ)", "QQQ")],
+           "nikkei": [REIHE("Hang Seng", "^HSI")], "hsi": [REIHE("Nikkei 225", "^N225")], "vix": [REIHE("S&P 500", "^GSPC")]}
+    MARKT = {"dax": news.get("^GDAXI", []) + news.get("SPY", []), "nikkei": news.get("^N225", []), "hsi": news.get("^HSI", [])}
+    us_markt = sorted(news.get("SPY", []) + news.get("QQQ", []), key=lambda x: x["zeit"])
 
+    plaene = {}   # Chart-id -> Liste von Plänen
     live = {"now": minute(jetzt), "stand": f"{jetzt:%H:%M}", "idx": {}, "stocks": [], "ev": {}, "evfor": {}, "sec": {},
-            "logos": {t: logo_urls(t) for t in FIRMEN}}
+            "logos": {t: logo_urls(t) for t in FIRMEN}, "er": termine}
     for b, (t, name, cur, boerse, ntk) in INDIZES.items():
-        if t not in kurse:
+        if t not in sitzungen:
             continue
-        sz = sitzung(kurse[t], boerse)
+        sz = sitzungen[t]
         h, v0, vix = sz["heute"], sz["vortag"], b == "vix"
         live["idx"][b] = {"name": name, "cur": cur, "prev": v0, "last": float(h.iloc[-1]), "dom": sz["dom"], "status": sz["status"],
                           "lunch": sz["pause"], "open": float(h.iloc[0]), "high": float(h.max()), "low": float(h.min()),
-                          "s": [[minute(ts), round(float(x), 2) if vix else round((float(x) / v0 - 1) * 100, 4)] for ts, x in h.items()]}
-        ev = ereignisse(news.get(ntk, []), sz, b, tr)
-        live["ev"].update(ev)
-        live["evfor"][b] = list(ev)
+                          "s": [[minute(ts), round(float(x), 2) if vix else round(float(y), 4)] for (ts, x), y in zip(h.items(), sz["pct"].values)]}
+        eigene = news.get(ntk, [])
+        markt = MARKT.get(b, us_markt)
+        plaene[b] = plaene_fuer(name, sz, t, eigene, markt if markt is not eigene else [], VGL.get(b, []), [],
+                                5.0 if vix else 0.35, prozent=True)
 
     sektor_von = {t: (sec, w) for sec, (_, a) in BRANCHEN.items() for t, w in a.items()}
     for t in aktien:
-        if t not in kurse:
+        if t not in sitzungen:
             continue
-        sz = sitzung(kurse[t], boerse_von(t))
-        h, v0 = sz["heute"], sz["vortag"]
+        sz = sitzungen[t]
+        h = sz["heute"]
         sec, w = sektor_von.get(t, (None, 0))
         i = bid(t)
-        live["stocks"].append({"id": i, "tk": t, "name": FIRMEN.get(t, [t])[0], "cur": "EUR" if t.endswith(".DE") else "USD",
-                               "last": float(h.iloc[-1]), "p": (float(h.iloc[-1]) / v0 - 1) * 100, "dom": sz["dom"],
-                               "status": sz["status"], "sec": sec, "w": w, "list": 1 if t in LISTE else 0,
-                               "s": [[minute(ts), round((float(x) / v0 - 1) * 100, 4)] for ts, x in h.items()]})
-        ev = ereignisse(news.get(t, []), sz, i, tr, maximal=4)
-        live["ev"].update(ev)
-        live["evfor"][i] = list(ev)
+        name = FIRMEN.get(t, [t])[0]
+        live["stocks"].append({"id": i, "tk": t, "name": name, "cur": "EUR" if t.endswith(".DE") else "USD",
+                               "last": float(h.iloc[-1]), "p": float(sz["pct"].iloc[-1]), "dom": sz["dom"], "status": sz["status"],
+                               "sec": sec, "w": w, "list": 1 if t in LISTE else 0,
+                               "s": [[minute(ts), round(float(y), 4)] for ts, y in sz["pct"].items()]})
+        de = t.endswith(".DE")
+        vgl = [REIHE("DAX", "^GDAXI")] if de else US_VGL
+        markt = news.get("^GDAXI", []) if de else us_markt
+        plaene[i] = plaene_fuer(name, sz, t, news.get(t, []), markt, vgl, termine_von.get(t, []), 1.0 if t != "BTC-USD" else 1.2)
 
-    # Ø aller Märkte: die jüngsten Meldungen der großen Märkte
-    welt = sorted((k for k in live["ev"] if k.rstrip("0123456789") in ("spx", "qqq", "dax", "nikkei", "hsi", "dow")),
-                  key=lambda k: live["ev"][k]["t"])
-    live["evfor"]["welt"] = welt[-8:]
+    # Ø aller Märkte: Durchschnitt wie im Board, Bewegungen mit den treibenden Indizes als Grund
+    mitglieder = [b for b in live["idx"] if b != "vix"]
+    if mitglieder:
+        datum = max(sitzungen[INDIZES[b][0]]["heute"].index[-1].date() for b in mitglieder)
+        raster = pd.date_range(datetime.combine(datum, time(0, 0), BERLIN), min(jetzt, datetime.combine(datum, time(23, 55), BERLIN)), freq="5min")
+        spalten = {}
+        for b in mitglieder:
+            s = pct[INDIZES[b][0]]
+            s = s if s.index[-1].date() == datum else pd.Series(dtype=float)
+            spalten[INDIZES[b][1]] = s.reindex(s.index.union(raster)).ffill().reindex(raster).fillna(0)
+        df = pd.DataFrame(spalten)
+        welt = df.mean(axis=1)
+        wp = []
+        sp = float(welt.max() - welt.min())
+        for t0, t1, d in bewegungen(welt, max(0.2, 0.28 * sp)):
+            treiber = sorted(((n, float(df[n].asof(t1) - df[n].asof(t0))) for n in df.columns), key=lambda x: -abs(x[1]))
+            vgl = [(n, c, "pct") for n, c in treiber[:3] if abs(c) >= 0.15]
+            region = next((b for b in mitglieder if INDIZES[b][1] == (vgl[0][0] if vgl else "")), "spx")
+            eig = news.get(INDIZES[region][4], []) + (us_markt if INDIZES[region][3] is NY else [])
+            p = plane("Ø aller Märkte", t0, t1, d, sorted(eig, key=lambda x: x["zeit"]), [], vgl, [], INDIZES[region][3])
+            wp.append(p)
+        plaene["welt"] = wp
+
+    # alles Nötige auf einen Schlag übersetzen
+    texte = []
+    for liste in plaene.values():
+        for p in liste:
+            for n in p["eigen"] + p["markt"]:
+                texte += [n["titel"], n["text"]]
+    for etf, _ in BRANCHEN.values():
+        for n in news.get(etf, [])[-8:]:
+            texte += [n["titel"], n["text"]]
+    tr = deutsch(texte)
+
+    nr = 0
+    for cid, liste in plaene.items():
+        keys = []
+        for p in liste:
+            k, ev = schreibe(p, tr, nr)
+            nr += 1
+            live["ev"][k] = ev
+            keys.append(k)
+        live["evfor"][cid] = keys
 
     p_von = {s["tk"]: s["p"] for s in live["stocks"]}
-    for sec, (etf, mitglieder) in BRANCHEN.items():
-        werte = [(p_von[t], w) for t, w in mitglieder.items() if t in p_von]
+    for sec, (etf, mitgl) in BRANCHEN.items():
+        werte = [(p_von[t], w) for t, w in mitgl.items() if t in p_von]
         p = sum(a * w for a, w in werte) / sum(w for _, w in werte) if werte else 0
-        meldungen = [{"h": html.escape(tr(n["titel"])), "b": html.escape(tr(n["text"]))[:260] if n["text"] else "",
-                      "link": n["link"], "src": html.escape(n["quelle"])} for n in news.get(etf, [])[-4:][::-1]]
+        meldungen = []
+        for n in news.get(etf, [])[::-1]:
+            h_de = tr(n["titel"])
+            if not h_de:
+                continue
+            x_de = tr(n["text"]) if n["text"] else ""
+            meldungen.append({"h": html.escape(h_de), "b": html.escape(x_de or "")[:260], "link": n["link"], "src": html.escape(n["quelle"])})
+            if len(meldungen) == 4:
+                break
         live["sec"][sec] = {"p": p, "news": meldungen}
 
-    live["er"] = quartalszahlen(tuple(QUARTALS_LISTE))
     live["foot"] = (f"Live-Daten von Yahoo Finance, bis ca. 15 Min. verzögert · Stand {jetzt:%d.%m.%Y, %H:%M} Uhr · "
-                    "Nachrichten automatisch übersetzt · MSCI World = ETF URTH, FTSE All-World = ETF VT, S&amp;P 500 Tech = ETF XLK · "
-                    "Seite neu laden für frische Kurse · Keine Anlageberatung")
+                    "Zeitstempel markieren die großen Kursbewegungen mit ihren wahrscheinlichen Gründen · Nachrichten automatisch übersetzt · "
+                    "MSCI World = ETF URTH, FTSE All-World = ETF VT, S&amp;P 500 Tech = ETF XLK · Seite neu laden für frische Kurse · "
+                    "Keine Anlageberatung")
     return live
 
 

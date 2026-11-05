@@ -500,7 +500,8 @@ function erDetail(e){const now=Date.now(),past=e.t<=now,rows=[];
 if(LIVE){ER.length=0;ER.push(...LIVE.er)}
 const qtrack=$('qtrack'),qbox=$('q');let GR=[];
 const qx=(t,now,K)=>{const h=(t-now)/36e5;return Math.sign(h)*K*Math.log(1+Math.abs(h)/1.2)};   // nah = breit, fern = gestaucht
-function renderQ(){const now=Date.now(),half=qbox.clientWidth/2,K=Math.max(60,(half-120)/Math.log(1+30/1.2));
+function renderQ(){if(!ER.length){qtrack.innerHTML='<span class="qday" style="left:-120px;bottom:30px">Gerade keine Quartalszahlen-Termine</span>';$('qnow').textContent='Jetzt';return}
+  const now=Date.now(),half=qbox.clientWidth/2,K=Math.max(60,(half-120)/Math.log(1+30/1.2));
   GR=[];for(const e of ER){const g=GR[GR.length-1];if(g&&e.t-g.items[g.items.length-1].t<=70*6e4)g.items.push(e);else GR.push({items:[e]})}
   for(const g of GR)g.x=qx(g.items[0].t,now,K);const GAP=172;
   const fut=GR.filter(g=>g.x>=0),pst=GR.filter(g=>g.x<0).reverse();
@@ -613,10 +614,10 @@ function draw(anim){
     const open=()=>{closePop();g.classList.add('on');
       const v0=at(d,e.t),t1=Math.min(e.t+30,last[0]),v1=at(d,t1),mv=d.lvl?(v1/v0-1)*100:v1-v0;
       openPop(`<div class="when">${e.ca?'ca. ':''}${hm(e.t)} Uhr · ${e.place}</div><h3>${e.h}</h3>${e.b&&e.b.length?`<ul>${e.b.map(x=>`<li>${x}</li>`).join('')}</ul>`:''}
-        ${e.w?`<div class="why"><b>Möglicher Auslöser:</b> ${e.w}</div>`:''}${e.link?`<a class="src" href="${e.link}" target="_blank" rel="noopener">${e.place||'Quelle'} ↗</a>`:''}
+        ${e.w?`<div class="why"><b>Wahrscheinlicher Grund:</b> ${e.w}</div>`:''}${e.link?`<a class="src" href="${e.link}" target="_blank" rel="noopener">${e.src||e.place||'Quelle'} ↗</a>`:''}
         ${t1>e.t+5?`<div class="mv">${d.id==='welt'?'Ø Markt':d.name} in den ${Math.round(t1-e.t)} Minuten danach: <b class="${mv>=0?'up':'dn'}">${d.lvl?fp(mv):sg(mv)+nf(Math.abs(mv))+' Prozentpunkte'}</b></div>`:''}`,g.querySelector('rect'))};
     g.addEventListener('click',open);g.addEventListener('keydown',ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();open()}})});
-  $('lgx').textContent=d.est?'≈ Schätzung':isStock(d)?'Verlauf geschätzt, Kurs echt · Zeitstempel antippen':'Zeitstempel antippen für Infos';
+  $('lgx').textContent=LIVE?'Zeitstempel markieren große Bewegungen – antippen für die Gründe':d.est?'≈ Schätzung':isStock(d)?'Verlauf geschätzt, Kurs echt · Zeitstempel antippen':'Zeitstempel antippen für Infos';
 }
 
 /* ===== Auswahl über dem Chart ===== */
